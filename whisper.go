@@ -6,6 +6,7 @@ package whisper
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"regexp"
@@ -42,6 +43,13 @@ const (
 	Max
 	Min
 )
+
+type ReaderWriterAt interface {
+	io.Reader
+	io.ReaderAt
+	io.Writer
+	io.WriterAt
+}
 
 func unitMultiplier(s string) (int, error) {
 	switch {
@@ -81,13 +89,13 @@ func parseRetentionPart(retentionPart string) (int, error) {
 }
 
 /*
-  Parse a retention definition as you would find in the storage-schemas.conf of a Carbon install.
-  Note that this only parses a single retention definition, if you have multiple definitions (separated by a comma)
-  you will have to split them yourself.
+	Parse a retention definition as you would find in the storage-schemas.conf of a Carbon install.
+	Note that this only parses a single retention definition, if you have multiple definitions (separated by a comma)
+	you will have to split them yourself.
 
-  ParseRetentionDef("10s:14d") Retention{10, 120960}
+	ParseRetentionDef("10s:14d") Retention{10, 120960}
 
-  See: http://graphite.readthedocs.org/en/1.0/config-carbon.html#storage-schemas-conf
+	See: http://graphite.readthedocs.org/en/1.0/config-carbon.html#storage-schemas-conf
 */
 func ParseRetentionDef(retentionDef string) (*Retention, error) {
 	parts := strings.Split(retentionDef, ":")
@@ -124,7 +132,8 @@ func ParseRetentionDefs(retentionDefs string) (Retentions, error) {
 	Represents a Whisper database file.
 */
 type Whisper struct {
-	file *os.File
+	rw     ReaderWriterAt
+	closer io.Closer
 
 	// Metadata
 	aggregationMethod AggregationMethod
@@ -152,7 +161,8 @@ func Create(path string, retentions Retentions, aggregationMethod AggregationMet
 	whisper = new(Whisper)
 
 	// Set the metadata
-	whisper.file = file
+	whisper.rw = file
+	whisper.closer = file
 	whisper.aggregationMethod = aggregationMethod
 	whisper.xFilesFactor = xFilesFactor
 	for _, retention := range retentions {
@@ -179,11 +189,10 @@ func Create(path string, retentions Retentions, aggregationMethod AggregationMet
 	chunkSize := 16384
 	zeros := make([]byte, chunkSize)
 	for remaining > chunkSize {
-		whisper.file.Write(zeros)
+		whisper.rw.Write(zeros)
 		remaining -= chunkSize
 	}
-	whisper.file.Write(zeros[:remaining])
-	// whisper.file.Sync()
+	whisper.rw.Write(zeros[:remaining])
 
 	return whisper, nil
 }
@@ -218,7 +227,7 @@ func validateRetentions(retentions Retentions) error {
 }
 
 /*
-  Open an existing Whisper database and read it's header
+	Open an existing Whisper database and read it's header
 */
 func Open(path string) (whisper *Whisper, err error) {
 	file, err := os.OpenFile(path, os.O_RDWR, 0666)
@@ -226,7 +235,8 @@ func Open(path string) (whisper *Whisper, err error) {
 		return nil, err
 	}
 	whisper = new(Whisper)
-	whisper.file = file
+	whisper.rw = file
+	whisper.closer = file
 
 	// read the metadata
 	b := make([]byte, MetadataSize)
@@ -257,6 +267,41 @@ func Open(path string) (whisper *Whisper, err error) {
 	return whisper, nil
 }
 
+func OpenGeneric(rw ReaderWriterAt) (*Whisper, error) {
+	whisper := new(Whisper)
+	whisper.rw = rw
+
+	// read the metadata
+	b := make([]byte, MetadataSize)
+	offset := 0
+	rw.Read(b)
+
+	a := unpackInt(b[offset : offset+IntSize])
+	if a > 1024 { // support very old format. File starts with lastUpdate and has only average aggregation method
+		whisper.aggregationMethod = Average
+	} else {
+		whisper.aggregationMethod = AggregationMethod(a)
+	}
+
+	offset += IntSize
+	whisper.maxRetention = unpackInt(b[offset : offset+IntSize])
+	offset += IntSize
+	whisper.xFilesFactor = unpackFloat32(b[offset : offset+FloatSize])
+	offset += FloatSize
+	archiveCount := unpackInt(b[offset : offset+IntSize])
+	offset += IntSize
+
+	// read the archive info
+	b = make([]byte, ArchiveInfoSize*archiveCount)
+	rw.Read(b)
+	whisper.archives = make([]archiveInfo, archiveCount)
+	for i := 0; i < archiveCount; i++ {
+		whisper.archives[i] = unpackArchiveInfo(b[i*ArchiveInfoSize : (i+1)*ArchiveInfoSize])
+	}
+
+	return whisper, nil
+}
+
 func (whisper *Whisper) writeHeader() (err error) {
 	b := make([]byte, whisper.MetadataSize())
 	i := 0
@@ -269,20 +314,22 @@ func (whisper *Whisper) writeHeader() (err error) {
 		i += packInt(b, archive.secondsPerPoint, i)
 		i += packInt(b, archive.numberOfPoints, i)
 	}
-	_, err = whisper.file.Write(b)
+	_, err = whisper.rw.Write(b)
 
 	return err
 }
 
 /*
-  Close the whisper file
+	Close the whisper file
 */
 func (whisper *Whisper) Close() {
-	whisper.file.Close()
+	if whisper.closer != nil {
+		whisper.closer.Close()
+	}
 }
 
 /*
-  Calculate the total number of bytes the Whisper file should be according to the metadata.
+	Calculate the total number of bytes the Whisper file should be according to the metadata.
 */
 func (whisper *Whisper) Size() int {
 	size := whisper.MetadataSize()
@@ -293,7 +340,7 @@ func (whisper *Whisper) Size() int {
 }
 
 /*
-  Calculate the number of bytes the metadata section will be.
+	Calculate the number of bytes the metadata section will be.
 */
 func (whisper *Whisper) MetadataSize() int {
 	return MetadataSize + (ArchiveInfoSize * len(whisper.archives))
@@ -338,10 +385,10 @@ func (whisper *Whisper) Retentions() []Retention {
 }
 
 /*
-  Update a value in the database.
+	Update a value in the database.
 
-  If the timestamp is in the future or outside of the maximum retention it will
-  fail immediately.
+	If the timestamp is in the future or outside of the maximum retention it will
+	fail immediately.
 */
 func (whisper *Whisper) Update(value float64, timestamp int) (err error) {
 	diff := int(time.Now().Unix()) - timestamp
@@ -362,7 +409,7 @@ func (whisper *Whisper) Update(value float64, timestamp int) (err error) {
 	myInterval := timestamp - mod(timestamp, archive.secondsPerPoint)
 	point := dataPoint{myInterval, value}
 
-	_, err = whisper.file.WriteAt(point.Bytes(), whisper.getPointOffset(myInterval, &archive))
+	_, err = whisper.rw.WriteAt(point.Bytes(), whisper.getPointOffset(myInterval, &archive))
 	if err != nil {
 		return err
 	}
@@ -419,10 +466,10 @@ func (whisper *Whisper) archiveUpdateMany(archive *archiveInfo, points []*TimeSe
 		bytesBeyond := int(myOffset-archive.End()) + len(packedBlocks[i])
 		if bytesBeyond > 0 {
 			pos := len(packedBlocks[i]) - bytesBeyond
-			whisper.file.WriteAt(packedBlocks[i][:pos], myOffset)
-			whisper.file.WriteAt(packedBlocks[i][pos:], archive.Offset())
+			whisper.rw.WriteAt(packedBlocks[i][:pos], myOffset)
+			whisper.rw.WriteAt(packedBlocks[i][pos:], archive.Offset())
 		} else {
-			whisper.file.WriteAt(packedBlocks[i], myOffset)
+			whisper.rw.WriteAt(packedBlocks[i], myOffset)
 		}
 	}
 
@@ -557,7 +604,7 @@ func (whisper *Whisper) propagate(timestamp int, higher, lower *archiveInfo) (bo
 	} else {
 		aggregateValue := aggregate(whisper.aggregationMethod, knownValues)
 		point := dataPoint{lowerIntervalStart, aggregateValue}
-		whisper.file.WriteAt(point.Bytes(), whisper.getPointOffset(lowerIntervalStart, lower))
+		whisper.rw.WriteAt(point.Bytes(), whisper.getPointOffset(lowerIntervalStart, lower))
 	}
 	return true, nil
 }
@@ -567,19 +614,19 @@ func (whisper *Whisper) readSeries(start, end int64, archive *archiveInfo) []dat
 	var b []byte
 	if start < end {
 		b = make([]byte, end-start)
-		whisper.file.ReadAt(b, start)
+		whisper.rw.ReadAt(b, start)
 	} else {
 		b = make([]byte, archive.End()-start)
-		whisper.file.ReadAt(b, start)
+		whisper.rw.ReadAt(b, start)
 		b2 := make([]byte, end-archive.Offset())
-		whisper.file.ReadAt(b2, archive.Offset())
+		whisper.rw.ReadAt(b2, archive.Offset())
 		b = append(b, b2...)
 	}
 	return unpackDataPoints(b)
 }
 
 /*
-  Calculate the starting time for a whisper db.
+	Calculate the starting time for a whisper db.
 */
 func (whisper *Whisper) StartTime() int {
 	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
@@ -587,7 +634,7 @@ func (whisper *Whisper) StartTime() int {
 }
 
 /*
-  Fetch a TimeSeries for a given time span from the file.
+	Fetch a TimeSeries for a given time span from the file.
 */
 func (whisper *Whisper) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, err error) {
 	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
@@ -658,7 +705,7 @@ func (whisper *Whisper) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, 
 func (whisper *Whisper) readInt(offset int64) (int, error) {
 	// TODO: make errors better
 	b := make([]byte, IntSize)
-	_, err := whisper.file.ReadAt(b, offset)
+	_, err := whisper.rw.ReadAt(b, offset)
 	if err != nil {
 		return 0, err
 	}
@@ -667,10 +714,10 @@ func (whisper *Whisper) readInt(offset int64) (int, error) {
 }
 
 /*
-  A retention level.
+	A retention level.
 
-  Retention levels describe a given archive in the database. How detailed it is and how far back
-  it records.
+	Retention levels describe a given archive in the database. How detailed it is and how far back
+	it records.
 */
 type Retention struct {
 	secondsPerPoint int
@@ -710,10 +757,10 @@ func (r retentionsByPrecision) Less(i, j int) bool {
 }
 
 /*
-  Describes a time series in a file.
+	Describes a time series in a file.
 
-  The only addition this type has over a Retention is the offset at which it exists within the
-  whisper file.
+	The only addition this type has over a Retention is the offset at which it exists within the
+	whisper file.
 */
 type archiveInfo struct {
 	Retention
